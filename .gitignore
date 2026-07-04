@@ -1,0 +1,19 @@
+# Environnement virtuel
+.venv/
+
+# Données volumineuses (MovieLens)
+Data/
+
+# Artefacts générés
+data/processed/
+reports/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
