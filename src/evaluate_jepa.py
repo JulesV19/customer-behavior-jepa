@@ -82,9 +82,12 @@ def encode_eval(model, sequences, device, split: str = "test", batch: int = 128)
     ds = JepaEvalDataset(sequences, split=split, K=CHUNK_SIZE, min_chunks=3)
     loader = DataLoader(ds, batch_size=batch, shuffle=False, collate_fn=collate_eval)
     Z, H, T = [], [], []
-    for chunks, mask, target in loader:
+    for chunks, mask, target, levels, bias in loader:
         chunks, mask = chunks.to(device), mask.to(device)
-        c = model.online_chunk(chunks.reshape(-1, CHUNK_SIZE)).reshape(chunks.shape[0], chunks.shape[1], -1)
+        lv = levels.to(device).reshape(-1, CHUNK_SIZE) if model.use_ratings else None
+        bs = bias.to(device).reshape(-1, CHUNK_SIZE) if model.use_ratings else None
+        c = model.online_chunk(chunks.reshape(-1, CHUNK_SIZE), lv, bs) \
+            .reshape(chunks.shape[0], chunks.shape[1], -1)
         h = model.temporal(c, ~mask)
         zhat = model.predictor(h)
         last = mask.sum(dim=1) - 1                         # index du dernier chunk réel
@@ -363,3 +366,33 @@ def pca_chunks(model, sequences, maps, device, n_chunks=4000, seed=0, n_componen
     pca = PCA(n_components=n_components)
     proj = pca.fit_transform(emb)
     return proj, genres[:n_chunks], pca.explained_variance_ratio_
+
+
+# --------------------------------------------------------------------------- #
+# 5. Suite complète de métriques (pour comparer plusieurs modèles)
+# --------------------------------------------------------------------------- #
+@torch.no_grad()
+def evaluate_model(model, sequences, maps, genome, device, eval_users: int = 8000,
+                   seed: int = 0, ks_film=(10, 20, 50, 100), ks_chunk=(1, 5, 10, 20)) -> dict:
+    """Calcule toute la suite d'éval pour UN modèle -> dict de métriques scalaires.
+
+    Réutilise les fonctions existantes ; conçu pour être appelé une fois par modèle
+    afin de construire un tableau comparatif. Les baselines model-free (popularité,
+    répétition, kNN-contenu) sont incluses ici mais IDENTIQUES entre modèles.
+    """
+    eval_sub = sequences.sample(eval_users, random_state=seed).reset_index(drop=True)
+    diag = representation_diagnostics(model, sequences, device, seed=seed)
+    item_bank = build_item_bank(model, device)
+    zhat, H, T = encode_eval(model, eval_sub, device, split="test")
+    rf = retrieval_films(zhat, item_bank, T, sequences, maps, ks=ks_film, device=device)
+    rc = retrieval_chunks(model, zhat, eval_sub, maps, device, ks=ks_chunk)
+    r2 = probe_genome(H, T, genome)
+    auc, _ = probe_genres(H, T, maps)
+    return {
+        "rand_cos": diag["mean_pairwise_cos_targets"],
+        "anisotropy": diag["anisotropy_mean_dir_norm"],
+        "recall_film": rf["recall_model"], "recall_pop": rf["recall_pop"],
+        "median_rank_film": rf["median_rank_model"],
+        "recall_chunk": rc["recall_model"], "recall_repeat": rc["recall_repeat"],
+        "probe_genome_r2": r2, "probe_genres_auc": auc, "n_eval": len(eval_sub),
+    }

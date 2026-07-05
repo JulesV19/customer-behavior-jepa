@@ -24,19 +24,40 @@ import torch.nn.functional as F
 # Briques
 # --------------------------------------------------------------------------- #
 class ItemTokenizer(nn.Module):
-    """Film -> token : embedding d'ID appris + projection du vecteur genome (fusion additive)."""
+    """Film -> token : embedding d'ID + projection genome (+ note de l'user, optionnel).
 
-    def __init__(self, n_items: int, genome, d_model: int, pad_idx: int = 0):
+    Si `use_ratings`, on FUSIONNE additivement deux signaux de note :
+      - un embedding appris du NIVEAU (10 demi-étoiles) ; l'index 0 = note INCONNUE
+        (cible/item-bank/padding) -> vecteur nul (padding_idx) ;
+      - un scalaire de BIAIS user (note - moyenne du user) projeté sans biais affine,
+        de sorte qu'une déviation nulle (ou inconnue) n'ajoute rien.
+    Appeler forward SANS levels/bias donne une repr "rating-free" (utile pour la cible).
+    """
+
+    def __init__(self, n_items: int, genome, d_model: int, pad_idx: int = 0,
+                 use_ratings: bool = False):
         super().__init__()
         self.pad_idx = pad_idx
+        self.use_ratings = use_ratings
         self.id_emb = nn.Embedding(n_items + 1, d_model, padding_idx=pad_idx)
         genome_t = torch.as_tensor(genome, dtype=torch.float32)
         self.register_buffer("genome", genome_t)              # (n_items+1, n_tags), figé
         self.genome_proj = nn.Linear(genome_t.shape[1], d_model)
+        if use_ratings:
+            # 0 = note inconnue -> vecteur nul ; 1..10 = demi-étoiles 0.5..5.0
+            self.rating_emb = nn.Embedding(11, d_model, padding_idx=0)
+            # bias=False : biais user nul (note = moyenne, ou inconnue) => contribution nulle
+            self.bias_proj = nn.Linear(1, d_model, bias=False)
         self.norm = nn.LayerNorm(d_model)
 
-    def forward(self, items: torch.Tensor) -> torch.Tensor:   # items: (...,) long
+    def forward(self, items: torch.Tensor, levels: torch.Tensor | None = None,
+                bias: torch.Tensor | None = None) -> torch.Tensor:
         tok = self.id_emb(items) + self.genome_proj(self.genome[items])
+        if self.use_ratings:
+            if levels is None:                                # cible / item-bank : rating-free
+                levels = torch.zeros_like(items)
+                bias = torch.zeros(items.shape, dtype=self.genome.dtype, device=items.device)
+            tok = tok + self.rating_emb(levels) + self.bias_proj(bias.unsqueeze(-1))
         return self.norm(tok)
 
 
@@ -60,8 +81,9 @@ class ChunkEmbedder(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(layer, layers, enable_nested_tensor=False)
 
-    def forward(self, chunk_items: torch.Tensor) -> torch.Tensor:  # (N, K) long
-        tok = self.tokenizer(chunk_items)                          # (N, K, d)
+    def forward(self, chunk_items: torch.Tensor, levels: torch.Tensor | None = None,
+                bias: torch.Tensor | None = None) -> torch.Tensor:  # (N, K)
+        tok = self.tokenizer(chunk_items, levels, bias)            # (N, K, d)
         cls = self.chunk_token.expand(tok.shape[0], -1, -1)        # (N, 1, d)
         x = torch.cat([cls, tok], dim=1)                           # (N, 1+K, d)
         out = self.encoder(x)                                      # attention pleine
@@ -109,9 +131,10 @@ class Predictor(nn.Module):
 class TrajectoryJEPA(nn.Module):
     def __init__(self, n_items: int, genome, d_model: int = 128, nhead: int = 4,
                  chunk_layers: int = 2, temporal_layers: int = 2, pred_hidden: int = 256,
-                 max_chunks: int = 128, ema: float = 0.996):
+                 max_chunks: int = 128, ema: float = 0.996, use_ratings: bool = False):
         super().__init__()
-        tokenizer = ItemTokenizer(n_items, genome, d_model)
+        self.use_ratings = use_ratings
+        tokenizer = ItemTokenizer(n_items, genome, d_model, use_ratings=use_ratings)
         self.online_chunk = ChunkEmbedder(tokenizer, d_model, nhead, chunk_layers)
         self.temporal = TemporalEncoder(d_model, nhead, temporal_layers, max_chunks)
         self.predictor = Predictor(d_model, pred_hidden)
@@ -130,15 +153,19 @@ class TrajectoryJEPA(nn.Module):
         for bo, bt in zip(self.online_chunk.buffers(), self.target_chunk.buffers()):
             bt.copy_(bo)
 
-    def forward(self, chunks: torch.Tensor, chunk_mask: torch.Tensor):
+    def forward(self, chunks: torch.Tensor, chunk_mask: torch.Tensor,
+                levels: torch.Tensor | None = None, bias: torch.Tensor | None = None):
         # chunks: (B, M, K) long ; chunk_mask: (B, M) True = chunk réel
+        # levels/bias: (B, M, K) notes de l'user (contexte) ; ignorés si use_ratings=False
         B, M, K = chunks.shape
         pad_mask = ~chunk_mask
         flat = chunks.reshape(B * M, K)
+        flat_lv = levels.reshape(B * M, K) if (self.use_ratings and levels is not None) else None
+        flat_bs = bias.reshape(B * M, K) if (self.use_ratings and bias is not None) else None
 
-        c = self.online_chunk(flat).reshape(B, M, -1)          # (B, M, d) online, avec gradient
+        c = self.online_chunk(flat, flat_lv, flat_bs).reshape(B, M, -1)  # online, AVEC notes
         with torch.no_grad():
-            z = self.target_chunk(flat).reshape(B, M, -1)      # (B, M, d) cible EMA, sans gradient
+            z = self.target_chunk(flat).reshape(B, M, -1)      # cible EMA, RATING-FREE (levels=None)
         h = self.temporal(c, pad_mask)                         # (B, M, d) contexte causal
         zhat = self.predictor(h)                               # (B, M, d) : ẑ_t prédit le chunk t+1
         return c, z, zhat

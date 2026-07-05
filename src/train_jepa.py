@@ -49,10 +49,13 @@ def _collapse_on_val(model, val_loader, device, max_batches: int = 20):
     """
     model.eval()
     reps = []
-    for i, (chunks, mask, _tgt) in enumerate(val_loader):
+    for i, (chunks, mask, _tgt, levels, bias) in enumerate(val_loader):
         chunks, mask = chunks.to(device), mask.to(device)
+        K = chunks.shape[-1]
         valid = mask.reshape(-1)
-        c = model.online_chunk(chunks.reshape(-1, chunks.shape[-1]))[valid]
+        lv = levels.to(device).reshape(-1, K) if model.use_ratings else None
+        bs = bias.to(device).reshape(-1, K) if model.use_ratings else None
+        c = model.online_chunk(chunks.reshape(-1, K), lv, bs)[valid]
         reps.append(c.cpu())
         if i + 1 >= max_batches:
             break
@@ -69,13 +72,13 @@ def _collapse_on_val(model, val_loader, device, max_batches: int = 20):
 
 def run(epochs: int = 15, batch_size: int = 128, d_model: int = 128, nhead: int = 4,
         chunk_layers: int = 2, temporal_layers: int = 2, pred_hidden: int = 256,
-        lr: float = 1e-3, ema: float = 0.996, subset: int | None = None, seed: int = 0,
-        num_workers: int = 2):
+        use_ratings: bool = True, lr: float = 1e-3, ema: float = 0.996,
+        subset: int | None = None, seed: int = 0, num_workers: int = 2):
     device = _device()
     torch.manual_seed(seed)
     print(f"device={device} | epochs={epochs} | batch={batch_size} | workers={num_workers}", flush=True)
     print(f"archi : d_model={d_model} nhead={nhead} chunk_layers={chunk_layers} "
-          f"temporal_layers={temporal_layers} pred_hidden={pred_hidden}", flush=True)
+          f"temporal_layers={temporal_layers} pred_hidden={pred_hidden} use_ratings={use_ratings}", flush=True)
 
     sequences, genome, maps = load_all()
     if subset:
@@ -97,9 +100,19 @@ def run(epochs: int = 15, batch_size: int = 128, d_model: int = 128, nhead: int 
 
     model = TrajectoryJEPA(maps.n_items, genome, d_model=d_model, nhead=nhead,
                            chunk_layers=chunk_layers, temporal_layers=temporal_layers,
-                           pred_hidden=pred_hidden, ema=ema).to(device)
+                           pred_hidden=pred_hidden, ema=ema, use_ratings=use_ratings).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     total_steps = epochs * len(train_loader)
+
+    # Mixed precision (AMP) : activée UNIQUEMENT sur CUDA (~x1.5-2, libère de la mémoire).
+    # Désactivée sur mps/cpu -> chemin identique au fp32 (autocast/scaler deviennent no-op).
+    use_amp = device == "cuda"
+    amp_dev = "cuda" if use_amp else "cpu"
+    try:                                          # API récente (torch >= 2.3)
+        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    except (AttributeError, TypeError):           # fallback torch plus anciens
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    print(f"AMP (mixed precision fp16) : {'ON' if use_amp else 'OFF'}", flush=True)
 
     history = []
     step = 0
@@ -110,16 +123,20 @@ def run(epochs: int = 15, batch_size: int = 128, d_model: int = 128, nhead: int 
         # accumulation en TENSEURS (sur le GPU, sans synchro) ; conversion float au log
         agg = {k: torch.zeros((), device=device) for k in ("loss", "inv", "var", "cov", "pred_std")}
         agg["n"] = 0
-        for chunks, mask in train_loader:
+        for chunks, mask, levels, bias in train_loader:
             chunks, mask = chunks.to(device), mask.to(device)
-            c, z, zhat = model(chunks, mask)
-            loss, logs = jepa_loss(c, z, zhat, mask)
+            levels, bias = levels.to(device), bias.to(device)
 
             for g in opt.param_groups:
                 g["lr"] = lr * _lr_factor(step, total_steps)
-            opt.zero_grad(); loss.backward()
+            opt.zero_grad()
+            with torch.autocast(device_type=amp_dev, dtype=torch.float16, enabled=use_amp):
+                c, z, zhat = model(chunks, mask, levels, bias)
+                loss, logs = jepa_loss(c, z, zhat, mask)
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)                              # dé-scale avant le clip de gradient
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step(); model.update_target()
+            scaler.step(opt); scaler.update(); model.update_target()
 
             for k in ("loss", "inv", "var", "cov", "pred_std"):
                 agg[k] += logs[k]                            # add tenseur, pas de synchro
@@ -150,7 +167,7 @@ def run(epochs: int = 15, batch_size: int = 128, d_model: int = 128, nhead: int 
             "state_dict": model.state_dict(),
             "config": {"n_items": maps.n_items, "d_model": d_model, "nhead": nhead,
                        "chunk_layers": chunk_layers, "temporal_layers": temporal_layers,
-                       "pred_hidden": pred_hidden, "ema": ema},
+                       "pred_hidden": pred_hidden, "use_ratings": use_ratings, "ema": ema},
             "epoch": epoch + 1,
         }
         torch.save(ckpt, PROCESSED / "jepa.pt")
@@ -161,17 +178,18 @@ def run(epochs: int = 15, batch_size: int = 128, d_model: int = 128, nhead: int 
     return history
 
 
-def load_model(device: str | None = None) -> TrajectoryJEPA:
-    """Recharge le modèle entraîné depuis le checkpoint."""
+def load_model(device: str | None = None, name: str = "jepa.pt") -> TrajectoryJEPA:
+    """Recharge un modèle entraîné depuis `data/processed/<name>` (défaut jepa.pt)."""
     device = device or _device()
     _, genome, _ = load_all()
-    ckpt = torch.load(PROCESSED / "jepa.pt", map_location=device, weights_only=False)
+    ckpt = torch.load(PROCESSED / name, map_location=device, weights_only=False)
     cfg = ckpt["config"]
-    # fallback sur les défauts d'archi pour les anciens checkpoints (avant scale-up)
+    # fallback sur les défauts d'archi pour les anciens checkpoints (avant scale-up / ratings)
     model = TrajectoryJEPA(cfg["n_items"], genome, d_model=cfg["d_model"],
                            nhead=cfg["nhead"], chunk_layers=cfg.get("chunk_layers", 2),
                            temporal_layers=cfg.get("temporal_layers", 2),
-                           pred_hidden=cfg.get("pred_hidden", 256), ema=cfg["ema"]).to(device)
+                           pred_hidden=cfg.get("pred_hidden", 256),
+                           use_ratings=cfg.get("use_ratings", False), ema=cfg["ema"]).to(device)
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
     return model

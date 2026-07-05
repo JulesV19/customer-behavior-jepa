@@ -27,6 +27,34 @@ def to_chunks(items, K: int = CHUNK_SIZE) -> np.ndarray:
     return np.asarray(items[: M * K], dtype=np.int64).reshape(M, K)
 
 
+def rating_levels(ratings) -> np.ndarray:
+    """Notes (demi-étoiles 0.5..5.0) -> niveaux entiers 1..10 (0 réservé = inconnu)."""
+    r = np.asarray(ratings, dtype=np.float32)
+    return np.rint(r * 2).astype(np.int64)                    # 0.5->1, 1.0->2, ..., 5.0->10
+
+
+def rating_bias(ratings) -> np.ndarray:
+    """Biais user : note - moyenne du user (capture qu'un 4 sévère != un 4 généreux).
+
+    Moyenne calculée sur tout l'historique du user (statistique stable ; la fuite via les
+    2 chunks tenus à l'écart est négligeable sur ~100+ notes).
+    """
+    r = np.asarray(ratings, dtype=np.float32)
+    return (r - r.mean()).astype(np.float32)
+
+
+def to_rating_chunks(ratings, K: int = CHUNK_SIZE):
+    """Notes d'un user -> (levels (M,K) int64, bias (M,K) float32), alignés sur to_chunks."""
+    lv = rating_levels(ratings)
+    bs = rating_bias(ratings)
+    M = len(lv) // K
+    if M == 0:
+        return np.zeros((0, K), dtype=np.int64), np.zeros((0, K), dtype=np.float32)
+    levels = lv[: M * K].reshape(M, K)                        # int64
+    bias = bs[: M * K].reshape(M, K).astype(np.float32)       # float32 (pas de troncature)
+    return levels, bias
+
+
 # --------------------------------------------------------------------------- #
 # Entraînement : prédiction de chaque chunk suivant dans le contexte
 # --------------------------------------------------------------------------- #
@@ -39,30 +67,37 @@ class JepaTrainDataset(Dataset):
     def __init__(self, sequences_df, K: int = CHUNK_SIZE, min_chunks: int = 4):
         self.K = K
         self.data = []
-        for items in sequences_df["items"].values:
+        for items, ratings in zip(sequences_df["items"].values, sequences_df["ratings"].values):
             ch = to_chunks(items, K)
             if len(ch) >= min_chunks:
-                self.data.append(ch[:-2])         # exclut val (M-2) et test (M-1)
+                lv, bs = to_rating_chunks(ratings, K)
+                # exclut val (M-2) et test (M-1) sur les 3 tableaux alignés
+                self.data.append((ch[:-2], lv[:-2], bs[:-2]))
 
     def __len__(self) -> int:
         return len(self.data)
 
-    def __getitem__(self, i) -> np.ndarray:       # (M', K)
+    def __getitem__(self, i):                     # (items, levels, bias), chacun (M', K)
         return self.data[i]
 
 
 def collate_train(batch, pad_item: int = 0):
-    """Pad la dimension chunk au max du lot. Renvoie (chunks, chunk_mask)."""
-    maxM = max(x.shape[0] for x in batch)
-    K = batch[0].shape[1]
+    """Pad la dimension chunk au max du lot. Renvoie (chunks, chunk_mask, levels, bias)."""
+    maxM = max(x[0].shape[0] for x in batch)
+    K = batch[0][0].shape[1]
     B = len(batch)
     chunks = np.full((B, maxM, K), pad_item, dtype=np.int64)
+    levels = np.zeros((B, maxM, K), dtype=np.int64)           # 0 = note inconnue (padding)
+    bias = np.zeros((B, maxM, K), dtype=np.float32)
     mask = np.zeros((B, maxM), dtype=bool)
-    for i, x in enumerate(batch):
-        m = x.shape[0]
-        chunks[i, :m] = x
+    for i, (it, lv, bs) in enumerate(batch):
+        m = it.shape[0]
+        chunks[i, :m] = it
+        levels[i, :m] = lv
+        bias[i, :m] = bs
         mask[i, :m] = True
-    return torch.from_numpy(chunks), torch.from_numpy(mask)
+    return (torch.from_numpy(chunks), torch.from_numpy(mask),
+            torch.from_numpy(levels), torch.from_numpy(bias))
 
 
 # --------------------------------------------------------------------------- #
@@ -79,34 +114,42 @@ class JepaEvalDataset(Dataset):
                  K: int = CHUNK_SIZE, min_chunks: int = 3):
         assert split in {"val", "test"}
         self.K = K
-        self.context, self.target = [], []
-        for items in sequences_df["items"].values:
+        # context = items du contexte (rétro-compat : utilisé tel quel par retrieval/knn) ;
+        # context_lv/context_bs = notes du contexte (pour l'encodeur online) ;
+        # target = chunk cible en items seuls (la cible est RATING-FREE).
+        self.context, self.context_lv, self.context_bs, self.target = [], [], [], []
+        for items, ratings in zip(sequences_df["items"].values, sequences_df["ratings"].values):
             ch = to_chunks(items, K)
             if len(ch) < min_chunks:
                 continue
-            if split == "test":
-                self.context.append(ch[:-1]); self.target.append(ch[-1])
-            else:  # val
-                self.context.append(ch[:-2]); self.target.append(ch[-2])
+            lv, bs = to_rating_chunks(ratings, K)
+            cut = -1 if split == "test" else -2          # cible = M-1 (test) ou M-2 (val)
+            self.context.append(ch[:cut]); self.target.append(ch[cut])
+            self.context_lv.append(lv[:cut]); self.context_bs.append(bs[:cut])
 
     def __len__(self) -> int:
         return len(self.context)
 
     def __getitem__(self, i):
-        return self.context[i], self.target[i]
+        return self.context[i], self.target[i], self.context_lv[i], self.context_bs[i]
 
 
 def collate_eval(batch, pad_item: int = 0):
-    """Renvoie (chunks_contexte, chunk_mask, target_chunk)."""
+    """Renvoie (chunks_contexte, chunk_mask, target_chunk, levels, bias)."""
     contexts = [b[0] for b in batch]
     targets = np.stack([b[1] for b in batch])        # (B, K)
     maxM = max(x.shape[0] for x in contexts)
     K = targets.shape[1]
     B = len(batch)
     chunks = np.full((B, maxM, K), pad_item, dtype=np.int64)
+    levels = np.zeros((B, maxM, K), dtype=np.int64)
+    bias = np.zeros((B, maxM, K), dtype=np.float32)
     mask = np.zeros((B, maxM), dtype=bool)
-    for i, x in enumerate(contexts):
+    for i, (x, lv, bs) in enumerate(zip(contexts, [b[2] for b in batch], [b[3] for b in batch])):
         m = x.shape[0]
         chunks[i, :m] = x
+        levels[i, :m] = lv
+        bias[i, :m] = bs
         mask[i, :m] = True
-    return torch.from_numpy(chunks), torch.from_numpy(mask), torch.from_numpy(targets)
+    return (torch.from_numpy(chunks), torch.from_numpy(mask), torch.from_numpy(targets),
+            torch.from_numpy(levels), torch.from_numpy(bias))
