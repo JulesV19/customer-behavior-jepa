@@ -47,13 +47,16 @@ class ChunkEmbedder(nn.Module):
     (cohérent avec l'artefact des rafales de notation).
     """
 
-    def __init__(self, tokenizer: ItemTokenizer, d_model: int, nhead: int, layers: int):
+    def __init__(self, tokenizer: ItemTokenizer, d_model: int, nhead: int, layers: int,
+                 dropout: float = 0.0):
         super().__init__()
         self.tokenizer = tokenizer
         self.chunk_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        # dropout=0 : sinon la variance VICReg peut être satisfaite par le BRUIT du dropout
+        # (l'encodeur triche en sortant un vecteur ~constant, révélé effondré en mode eval).
         layer = nn.TransformerEncoderLayer(
             d_model, nhead, dim_feedforward=4 * d_model, batch_first=True,
-            activation="gelu", norm_first=True,
+            activation="gelu", norm_first=True, dropout=dropout,
         )
         self.encoder = nn.TransformerEncoder(layer, layers, enable_nested_tensor=False)
 
@@ -68,12 +71,13 @@ class ChunkEmbedder(nn.Module):
 class TemporalEncoder(nn.Module):
     """Transformer CAUSAL sur la suite des vecteurs de chunk (l'ordre entre chunks compte)."""
 
-    def __init__(self, d_model: int, nhead: int, layers: int, max_chunks: int = 128):
+    def __init__(self, d_model: int, nhead: int, layers: int, max_chunks: int = 128,
+                 dropout: float = 0.0):
         super().__init__()
         self.pos = nn.Embedding(max_chunks, d_model)
         layer = nn.TransformerEncoderLayer(
             d_model, nhead, dim_feedforward=4 * d_model, batch_first=True,
-            activation="gelu", norm_first=True,
+            activation="gelu", norm_first=True, dropout=dropout,
         )
         self.encoder = nn.TransformerEncoder(layer, layers, enable_nested_tensor=False)
 
@@ -159,19 +163,28 @@ def variance_covariance(x: torch.Tensor, eps: float = 1e-4):
 
 
 def jepa_loss(c, z, zhat, chunk_mask,
-              lam_inv: float = 25.0, lam_var: float = 25.0, lam_cov: float = 1.0):
-    """Perte JEPA.
+              lam_inv: float = 25.0, lam_var: float = 25.0, lam_cov: float = 1.0,
+              center: bool = True):
+    """Perte JEPA (VICReg fidèle, corrigée après diagnostic d'effondrement).
 
-    - invariance : 1 - cosine(ẑ_t, z_{t+1})  (prédire la représentation du prochain chunk)
-    - variance + covariance (VICReg) sur les représentations ONLINE (ẑ et chunk c),
-      pour empêcher l'effondrement. La cible z est détachée (EMA), donc hors gradient.
+    - invariance : **MSE** entre ẑ_t et z_{t+1} (et non cosine : le cosine récompensait
+      une solution "tout constant sur une direction commune"). Si `center`, on retire la
+      moyenne du batch des deux côtés → on matche le RÉSIDU (structure) et non l'offset commun.
+    - variance + covariance (VICReg) sur les représentations ONLINE (ẑ et chunk c). Avec
+      dropout=0 dans les encodeurs, la variance ne peut plus être satisfaite par du bruit.
+      La cible z est détachée (EMA), donc hors gradient.
     """
     valid = chunk_mask[:, :-1] & chunk_mask[:, 1:]             # paires t -> t+1 valides
     pred = zhat[:, :-1][valid]                                 # (P, d)
     tgt = z[:, 1:][valid]                                      # (P, d) détaché
     c_on = c[:, :-1][valid]                                    # (P, d) chunk online
 
-    inv = (1.0 - F.cosine_similarity(pred, tgt, dim=-1)).mean()
+    pi, ti = (pred, tgt)
+    if center:                                                # matcher le résidu, pas l'offset
+        pi = pred - pred.mean(dim=0, keepdim=True)
+        ti = tgt - tgt.mean(dim=0, keepdim=True)
+    inv = F.mse_loss(pi, ti)
+
     var_p, cov_p = variance_covariance(pred)
     var_c, cov_c = variance_covariance(c_on)
     var = 0.5 * (var_p + var_c)
@@ -184,8 +197,8 @@ def jepa_loss(c, z, zhat, chunk_mask,
         "var": float(var.detach()),
         "cov": float(cov.detach()),
         "n_pairs": int(pred.shape[0]),
-        # métriques d'effondrement (à surveiller) :
-        "pred_std": float(pred.std(dim=0).mean().detach()),   # ~0 => effondrement
+        # écart-type des représentations (détecteur d'effondrement) :
+        "pred_std": float(pred.std(dim=0).mean().detach()),
         "tgt_std": float(tgt.std(dim=0).mean().detach()),
     }
     return total, logs

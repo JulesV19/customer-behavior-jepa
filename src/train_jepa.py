@@ -42,20 +42,29 @@ def _lr_factor(step: int, total: int, warmup: float = 0.05) -> float:
 
 
 @torch.no_grad()
-def _collapse_on_val(model, val_loader, device, max_batches: int = 20) -> float:
-    """std moyen des prédictions sur la validation (détecteur d'effondrement)."""
+def _collapse_on_val(model, val_loader, device, max_batches: int = 20):
+    """Détecteur d'effondrement FIABLE : en mode EVAL (dropout coupé), on regarde les
+    représentations de chunk (online). cos ~1.0 => effondrement ; std ~0 => effondrement.
+    (L'ancien détecteur regardait le prédicteur, ce qui masquait le collapse de l'encodeur.)
+    """
     model.eval()
-    stds = []
+    reps = []
     for i, (chunks, mask, _tgt) in enumerate(val_loader):
         chunks, mask = chunks.to(device), mask.to(device)
-        c, z, zhat = model(chunks, mask)
-        valid = mask[:, :-1] & mask[:, 1:]
-        if valid.any():
-            stds.append(float(zhat[:, :-1][valid].std(dim=0).mean()))
+        valid = mask.reshape(-1)
+        c = model.online_chunk(chunks.reshape(-1, chunks.shape[-1]))[valid]
+        reps.append(c.cpu())
         if i + 1 >= max_batches:
             break
     model.train()
-    return float(np.mean(stds)) if stds else float("nan")
+    if not reps:
+        return float("nan"), float("nan")
+    R = torch.cat(reps).float()
+    std = float(R.std(dim=0).mean())
+    Rn = torch.nn.functional.normalize(R, dim=-1)
+    perm = torch.randperm(R.shape[0])
+    cos = float((Rn * Rn[perm]).sum(-1).mean())               # cosine moyen entre chunks au hasard
+    return std, cos
 
 
 def run(epochs: int = 15, batch_size: int = 128, d_model: int = 128, nhead: int = 4,
@@ -113,12 +122,14 @@ def run(epochs: int = 15, batch_size: int = 128, d_model: int = 128, nhead: int 
                       f"{(time.time()-t0)/60:.1f} min", flush=True)
 
         tr = {k: agg[k] / agg["n"] for k in ("loss", "inv", "var", "cov", "pred_std")}
-        val_std = _collapse_on_val(model, val_loader, device)
+        val_std, val_cos = _collapse_on_val(model, val_loader, device)
         dt = time.time() - t0
-        rec = {"epoch": epoch + 1, **tr, "val_pred_std": val_std, "elapsed_s": round(dt, 1)}
+        rec = {"epoch": epoch + 1, **tr, "val_chunk_std": val_std, "val_chunk_cos": val_cos,
+               "elapsed_s": round(dt, 1)}
         history.append(rec)
+        # val_cos ~1.0 = EFFONDREMENT (à surveiller en priorité) ; doit rester bas (< ~0.5)
         print(f"epoch {epoch+1:2d}/{epochs} | loss {tr['loss']:.3f} | inv {tr['inv']:.4f} | "
-              f"pred_std {tr['pred_std']:.3f} | val_std {val_std:.3f} | {dt/60:.1f} min", flush=True)
+              f"eval chunk std {val_std:.3f} cos {val_cos:.3f} | {dt/60:.1f} min", flush=True)
 
         # Checkpoint à chaque epoch (écrase) : évaluable même si on interrompt
         PROCESSED.mkdir(parents=True, exist_ok=True)

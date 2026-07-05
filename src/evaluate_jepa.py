@@ -27,6 +27,34 @@ from .data_jepa import JepaEvalDataset, collate_eval, to_chunks, CHUNK_SIZE
 # Encodages de base
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
+def representation_diagnostics(model, sequences, device, n_chunks: int = 5000, seed: int = 0):
+    """Diagnostic d'anisotropie : à quel point les représentations se ressemblent-elles ?
+
+    Si la similarité cosine MOYENNE entre deux chunks au hasard est déjà élevée (~0.9),
+    alors un cosine de prédiction de 0.97 est TRIVIAL (l'espace est étroit) -> raccourci.
+    Si elle est basse (~0.2), un cosine élevé de prédiction est un vrai signal.
+    On mesure aussi l'écart entre 'similarité au bon chunk' et 'similarité à un chunk au hasard'.
+    """
+    from .data_jepa import to_chunks as _tc
+    rng = np.random.default_rng(seed)
+    chunks = []
+    for items in sequences.sample(min(3000, len(sequences)), random_state=seed)["items"].values:
+        for c in _tc(items, CHUNK_SIZE):
+            chunks.append(c)
+        if len(chunks) >= n_chunks:
+            break
+    chunks = torch.as_tensor(np.stack(chunks[:n_chunks]))
+    z = F.normalize(model.target_chunk(chunks.to(device)).cpu(), dim=-1)   # cibles normalisées
+    # similarité cosine moyenne entre paires aléatoires
+    perm = torch.randperm(z.shape[0])
+    rand_sim = (z * z[perm]).sum(-1).mean().item()
+    # anisotropie globale : norme du vecteur moyen (1 = tout aligné, 0 = isotrope)
+    mean_dir_norm = z.mean(0).norm().item()
+    return {"mean_pairwise_cos_targets": rand_sim, "anisotropy_mean_dir_norm": mean_dir_norm,
+            "n_chunks": z.shape[0]}
+
+
+@torch.no_grad()
 def build_item_bank(model, device, batch: int = 2048) -> torch.Tensor:
     """Chaque film encodé comme un chunk singleton (via l'encodeur CIBLE) -> (n_items+1, d).
 
