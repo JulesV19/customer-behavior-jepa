@@ -191,14 +191,20 @@ def jepa_loss(c, z, zhat, chunk_mask,
     cov = 0.5 * (cov_p + cov_c)
 
     total = lam_inv * inv + lam_var * var + lam_cov * cov
+    # Métriques gardées en TENSEURS détachés (pas de float() ici) : convertir en float
+    # force une synchro GPU->CPU bloquante ; on ne le fait qu'au moment de logger.
     logs = {
-        "loss": float(total.detach()),
-        "inv": float(inv.detach()),
-        "var": float(var.detach()),
-        "cov": float(cov.detach()),
-        "n_pairs": int(pred.shape[0]),
-        # écart-type des représentations (détecteur d'effondrement) :
-        "pred_std": float(pred.std(dim=0).mean().detach()),
-        "tgt_std": float(tgt.std(dim=0).mean().detach()),
+        "loss": total.detach(),
+        "inv": inv.detach(),
+        "var": var.detach(),
+        "cov": cov.detach(),
+        "n_pairs": pred.shape[0],
+        "pred_std": pred.std(dim=0).mean().detach(),
+        "tgt_std": tgt.std(dim=0).mean().detach(),
     }
     return total, logs
+
+
+def logs_to_float(logs: dict) -> dict:
+    """Convertit les métriques (tenseurs) en floats. À n'appeler qu'au moment de logger."""
+    return {k: (float(v) if torch.is_tensor(v) else v) for k, v in logs.items()}

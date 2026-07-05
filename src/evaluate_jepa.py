@@ -150,6 +150,72 @@ def retrieval_films(zhat, item_bank, target_chunks, sequences, maps,
 
 
 # --------------------------------------------------------------------------- #
+# 1bis. Baseline kNN-CONTENU (model-free) : "encore du même contenu"
+# --------------------------------------------------------------------------- #
+def _chunk_mean_genome(chunk_items, genome: np.ndarray) -> np.ndarray:
+    """Genome moyen des films d'un chunk (ignore le padding). -> (n_tags,)."""
+    ids = [int(x) for x in np.asarray(chunk_items).tolist() if int(x) != 0]
+    if not ids:
+        return np.zeros(genome.shape[1], dtype=np.float32)
+    return genome[ids].mean(axis=0)
+
+
+def content_knn_retrieval(sequences_eval, genome, maps, split: str = "test",
+                          ks_film=(10, 20, 50, 100), ks_chunk=(1, 5, 10, 20),
+                          device="cpu"):
+    """Baseline SANS MODÈLE : la requête est le genome moyen du DERNIER chunk de contexte.
+
+    C'est l'heuristique "persistance de contenu" (le signal court-portée du notebook 04),
+    sans rien apprendre. On classe :
+      - films  : par cosine(genome dernier chunk, genome du film) -> Recall@K, rang médian ;
+      - chunks : plus proche voisin parmi les vrais chunks cibles (genome moyen).
+    Même protocole/même échantillon que le JEPA -> comparaison apples-to-apples.
+    Si le JEPA bat cette baseline, il apporte + que "encore du même contenu".
+    """
+    ds = JepaEvalDataset(sequences_eval, split=split, K=CHUNK_SIZE, min_chunks=3)
+    U = len(ds)
+    g = torch.as_tensor(genome)                               # (n+1, n_tags)
+
+    # requête = genome moyen du dernier chunk de contexte de chaque user
+    q = torch.stack([torch.as_tensor(_chunk_mean_genome(ds.context[i][-1], genome))
+                     for i in range(U)])                      # (U, n_tags)
+    qn = F.normalize(q.to(device), dim=-1)
+
+    # ---- films ----
+    bank = F.normalize(g.to(device), dim=-1)                  # (n+1, n_tags)
+    scores = qn @ bank.T                                      # (U, n+1)
+    scores[:, 0] = -1e9                                       # exclut padding
+    order = torch.argsort(scores, dim=1, descending=True).cpu().numpy()
+    topk_max = max(ks_film)
+    hit = {k: 0 for k in ks_film}
+    ranks = []
+    for u in range(U):
+        truth = set(int(i) for i in np.asarray(ds.target[u]).tolist() if int(i) != 0)
+        if not truth:
+            continue
+        ranked = order[u]
+        pos = {int(f): r for r, f in enumerate(ranked[:topk_max])}
+        ranks.append(min((pos.get(f, topk_max) for f in truth), default=topk_max))
+        for k in ks_film:
+            if truth & set(int(x) for x in ranked[:k]):
+                hit[k] += 1
+    recall_film = {k: hit[k] / U for k in ks_film}
+    median_rank_film = float(np.median(ranks))
+
+    # ---- chunks ----
+    tgt = torch.stack([torch.as_tensor(_chunk_mean_genome(ds.target[i], genome))
+                       for i in range(U)])                    # (U, n_tags)
+    tn = F.normalize(tgt.to(device), dim=-1)
+    sims = qn @ tn.T                                          # (U, U)
+    rank_self = (sims.argsort(dim=1, descending=True) == torch.arange(U, device=device)[:, None]) \
+        .float().argmax(1)
+    recall_chunk = {k: float((rank_self < k).float().mean()) for k in ks_chunk}
+
+    return {"recall_film": recall_film, "median_rank_film": median_rank_film,
+            "recall_chunk": recall_chunk, "n": U}
+
+
+# --------------------------------------------------------------------------- #
 # 2. Retrieval niveau chunks (+ baseline répétition)
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
@@ -267,3 +333,33 @@ def umap_chunks(model, sequences, maps, device, n_chunks=4000, seed=0):
     emb = model.target_chunk(chunks.to(device)).cpu().numpy()
     proj = umap.UMAP(n_neighbors=15, min_dist=0.1, random_state=seed).fit_transform(emb)
     return proj, genres[:n_chunks]
+
+
+@torch.no_grad()
+def pca_chunks(model, sequences, maps, device, n_chunks=4000, seed=0, n_components=3):
+    """Contrôle LINÉAIRE de l'UMAP : même échantillon de chunks, projection PCA.
+
+    Déterministe et sans hyperparamètre. Si les genres se séparent DÉJÀ en PCA, la
+    structure est linéairement lisible (signal fort) ; sinon, la non-linéarité de
+    l'UMAP était nécessaire. On renvoie aussi la variance expliquée par chaque axe.
+    """
+    from sklearn.decomposition import PCA
+
+    movie = pd.read_csv(DATA / "movie.csv")
+    genre_by_movie = dict(zip(movie["movieId"], movie["genres"]))
+
+    chunks, genres = [], []
+    # MÊME tirage que umap_chunks (même seed) -> exactement les mêmes points encodés
+    for items in sequences["items"].sample(min(2000, len(sequences)), random_state=seed).values:
+        ch = to_chunks(items, CHUNK_SIZE)
+        for c in ch:
+            chunks.append(c)
+            first = genre_by_movie.get(maps.idx2movie[int(c[0])], "").split("|")[0]
+            genres.append(first)
+        if len(chunks) >= n_chunks:
+            break
+    chunks = torch.as_tensor(np.stack(chunks[:n_chunks]))
+    emb = model.target_chunk(chunks.to(device)).cpu().numpy()
+    pca = PCA(n_components=n_components)
+    proj = pca.fit_transform(emb)
+    return proj, genres[:n_chunks], pca.explained_variance_ratio_
