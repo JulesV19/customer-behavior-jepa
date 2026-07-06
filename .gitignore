@@ -4,6 +4,9 @@
 # Données volumineuses (MovieLens)
 Data/
 
+# Données volumineuses (Last.fm) + artefacts lastfm
+lastfm/data/
+
 # Artefacts générés
 data/processed/
 reports/
